@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { HOOK_LOAD_CONTRACTS } from './hook-load-contracts.js';
 import {
   MANAGED_EVENT_SCRIPTS,
   type ManagedHookCommands,
@@ -214,14 +215,22 @@ export function buildAgentHookTargets({ projectRoot, targetRoot }: BuildAgentHoo
       render: () => renderCodexHooksJson(targetRoot),
       targetPath: join(targetRoot, '.codex', 'hooks.json'),
       contentKind: 'json',
-      managedHooks: { targetRoot, commands: managedHookCommands('codex', targetRoot) },
+      managedHooks: {
+        targetRoot,
+        commands: managedHookCommands('codex', targetRoot),
+        contract: HOOK_LOAD_CONTRACTS.codex,
+      },
     },
     {
       name: 'gemini-hooks',
       render: () => renderGeminiHooksJson(targetRoot),
       targetPath: join(targetRoot, '.gemini', 'hooks.json'),
       contentKind: 'json',
-      managedHooks: { targetRoot, commands: managedHookCommands('gemini', targetRoot) },
+      managedHooks: {
+        targetRoot,
+        commands: managedHookCommands('gemini', targetRoot),
+        contract: HOOK_LOAD_CONTRACTS.gemini,
+      },
     },
   ];
 }

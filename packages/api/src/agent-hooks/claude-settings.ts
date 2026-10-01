@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { HealthResult } from './health.js';
+import { HOOK_LOAD_CONTRACTS } from './hook-load-contracts.js';
 import { inspectManagedHooks, mergeManagedHooks, readHookDocument } from './managed-hook-entries.js';
 import { managedHookCommands, type SyncOutcome } from './sync-targets.js';
 
@@ -12,7 +13,7 @@ function settingsPath(targetRoot: string): string {
 }
 
 function scope(targetRoot: string) {
-  return { targetRoot, commands: managedHookCommands('claude', targetRoot) };
+  return { targetRoot, commands: managedHookCommands('claude', targetRoot), contract: HOOK_LOAD_CONTRACTS.claude };
 }
 
 function stale(targetPath: string, reason: string, message: string): HealthResult {
