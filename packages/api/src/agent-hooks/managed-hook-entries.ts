@@ -89,15 +89,49 @@ type LocatedHandlers =
   | { ok: true; byEvent: Record<ManagedHookEvent, ManagedHandlerRef[]> }
   | { ok: false; reason: string };
 
+/**
+ * Structure that Claude, Codex and Gemini all require under `hooks`. Codex rejects the whole file
+ * on any mismatch (no hook loads at all), so such a file is refused, never merged or reported
+ * healthy. Event names and CLI-specific handler fields beyond these are not validated.
+ */
+function hookStructureProblem(hooks: JsonObject): string | undefined {
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) return `hooks.${event} must be an array`;
+    for (const [groupIndex, group] of groups.entries()) {
+      const problem = groupProblem(group, `hooks.${event}[${groupIndex}]`);
+      if (problem) return problem;
+    }
+  }
+  return undefined;
+}
+
+function groupProblem(group: unknown, at: string): string | undefined {
+  if (!isJsonObject(group)) return `${at} must be an object`;
+  if (group.matcher !== undefined && typeof group.matcher !== 'string') return `${at}.matcher must be a string`;
+  if (!Array.isArray(group.hooks)) return `${at}.hooks must be an array`;
+  for (const [handlerIndex, handler] of group.hooks.entries()) {
+    const problem = handlerProblem(handler, `${at}.hooks[${handlerIndex}]`);
+    if (problem) return problem;
+  }
+  return undefined;
+}
+
+function handlerProblem(handler: unknown, at: string): string | undefined {
+  if (!isJsonObject(handler) || typeof handler.type !== 'string') return `${at} must be an object with a string "type"`;
+  if (handler.type === 'command' && typeof handler.command !== 'string') return `${at}.command must be a string`;
+  if (handler.timeout !== undefined && typeof handler.timeout !== 'number') return `${at}.timeout must be a number`;
+  return undefined;
+}
+
 function locateManagedHandlers(document: unknown, scope: ManagedHookScope): LocatedHandlers {
   if (!isJsonObject(document)) return { ok: false, reason: 'hook config root must be a JSON object' };
   const hooks = document.hooks;
   if (hooks !== undefined && !isJsonObject(hooks)) return { ok: false, reason: '"hooks" must be a JSON object' };
+  const problem = hooks ? hookStructureProblem(hooks) : undefined;
+  if (problem) return { ok: false, reason: `invalid hook structure: ${problem}` };
   const byEvent = {} as Record<ManagedHookEvent, ManagedHandlerRef[]>;
   for (const event of MANAGED_EVENTS) {
-    const entries = hooks?.[event];
-    if (entries !== undefined && !Array.isArray(entries))
-      return { ok: false, reason: `"hooks.${event}" must be an array` };
+    const entries = hooks?.[event] as unknown[] | undefined;
     const desired = parseManagedCommand(scope.commands[event], scope.targetRoot);
     const refs: ManagedHandlerRef[] = [];
     (entries ?? []).forEach((group: unknown, groupIndex: number) => {

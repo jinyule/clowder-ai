@@ -138,6 +138,35 @@ describe('#1566 agent hook sync preserves third-party configuration', () => {
     }
   });
 
+  it('refuses invalid group/handler structure under any event, since the CLI then loads no hooks at all', async () => {
+    // Codex 0.159.3 rejects the whole hooks.json for each of these (hooks/list: 0 hooks + parse warning).
+    const managed = () => ({ SessionStart: [command(bashCmd(startScript))], Stop: [command(bashCmd(stopScript))] });
+    const invalidHooks = [
+      { SessionStart: [null] },
+      { SessionStart: [{ hooks: 'not-array' }] },
+      { SessionStart: [{ hooks: [{ type: 'command', command: 42 }] }] },
+      { ...managed(), PreToolUse: [{ hooks: 'not-array' }] },
+      { ...managed(), PreToolUse: [{ matcher: 7, hooks: [] }] },
+      { ...managed(), PreToolUse: [{ hooks: [{ command: 'echo missing-type' }] }] },
+      { ...managed(), PreToolUse: [{ hooks: [{ type: 'command', command: 'echo x', timeout: '5' }] }] },
+    ];
+    for (const hooks of invalidHooks) {
+      const label = JSON.stringify(hooks).slice(0, 120);
+      for (const [file, name] of [
+        ['.codex/hooks.json', 'codex-hooks'],
+        ['.gemini/hooks.json', 'gemini-hooks'],
+        ['.claude/settings.json', 'claude-settings'],
+      ]) {
+        const { path, text } = await writeJson(file, { hooks });
+        await syncAgentHooks({ projectRoot, targetRoot });
+        assert.equal(await readFile(path, 'utf8'), text, `${name} must stay untouched: ${label}`);
+        const health = await targetHealth(name);
+        assert.equal(health?.status, 'error', `${name} must report error: ${label}`);
+        assert.match(health?.reason ?? '', /hooks\.\w+\[\d+\]/, `${name} reason names the location: ${label}`);
+      }
+    }
+  });
+
   it('keeps a symlinked hooks.json as a symlink and merges into its target', async () => {
     const realPath = join(targetRoot, 'dotfiles', 'codex-hooks.json');
     await writeJson('dotfiles/codex-hooks.json', { hooks: { SessionStart: [thirdParty('start')] } });
