@@ -5,7 +5,7 @@
  * verified for that CLI version. Fields and event names a CLI ignores are accepted (#1566).
  */
 
-import { isJsonObject, JsonNumber, type JsonObject } from './json-source.js';
+import { isJsonObject, JsonNumber, type JsonObject, type ReaderFacts } from './json-source.js';
 
 interface Check {
   ok: (value: unknown) => boolean;
@@ -19,9 +19,18 @@ interface HandlerSpec {
   aliases?: readonly (readonly string[])[];
 }
 
+/** What the CLI's JSON reader itself accepts, before any hook schema applies. */
+interface ReaderLimits {
+  bom: boolean;
+  unpairedSurrogates: boolean;
+  /** Deepest container nesting the reader parses; the root container is level 1. */
+  maxDepth?: number;
+}
+
 export interface HookLoadContract {
   /** CLI and version the contract was verified against; shown in refusal reasons. */
   name: string;
+  reader: ReaderLimits;
   /** When set, any other top-level key makes the CLI reject the file. */
   rootKeys?: readonly string[];
   rootFields?: Readonly<Record<string, Check>>;
@@ -80,6 +89,8 @@ const handler = (
 /** codex-rs/config/src/hook_config.rs at rust-v0.159.3 (HooksFile, MatcherGroup, HookHandlerConfig). */
 const CODEX: HookLoadContract = {
   name: 'Codex CLI 0.159.3',
+  // serde_json: no BOM, no unpaired surrogate escape anywhere, recursion limit 128 (127 levels load).
+  reader: { bom: false, unpairedSurrogates: false, maxDepth: 127 },
   rootKeys: ['description', 'hooks'],
   rootFields: { description: nullable(str) },
   events: [
@@ -124,6 +135,7 @@ const CODEX: HookLoadContract = {
 /** Claude Code hooks reference plus black-box loading checks against 2.1.286. */
 const CLAUDE: HookLoadContract = {
   name: 'Claude Code 2.1.286',
+  reader: { bom: true, unpairedSurrogates: true },
   matcher: str,
   groupHooksRequired: true,
   common: { if: str, timeout: positive, statusMessage: str, once: bool },
@@ -145,6 +157,7 @@ const CLAUDE: HookLoadContract = {
  */
 const SHARED: HookLoadContract = {
   name: 'shared hook structure (Gemini loading unverified)',
+  reader: { bom: true, unpairedSurrogates: true },
   matcher: str,
   groupHooksRequired: true,
   common: { timeout: num },
@@ -186,6 +199,17 @@ function groupProblem(value: unknown, at: string, contract: HookLoadContract): s
   return undefined;
 }
 
+function readerProblem(facts: ReaderFacts, limits: ReaderLimits): string | undefined {
+  if (facts.bom && !limits.bom) return 'the file starts with a byte order mark';
+  if (facts.unpairedSurrogateAt !== undefined && !limits.unpairedSurrogates) {
+    return `the string at offset ${facts.unpairedSurrogateAt} contains an unpaired UTF-16 surrogate escape`;
+  }
+  if (limits.maxDepth !== undefined && facts.depth > limits.maxDepth) {
+    return `the file nests ${facts.depth} levels deep; at most ${limits.maxDepth} are parsed`;
+  }
+  return undefined;
+}
+
 function rootProblem(document: JsonObject, contract: HookLoadContract): string | undefined {
   const unknownRoot = contract.rootKeys && Object.keys(document).find((key) => !contract.rootKeys?.includes(key));
   if (unknownRoot) return `unknown top-level key "${unknownRoot}"`;
@@ -196,19 +220,29 @@ function rootProblem(document: JsonObject, contract: HookLoadContract): string |
 }
 
 /** Returns why the CLI would not load `document`, or undefined when every entry is in contract. */
-export function hookLoadProblem(document: JsonObject, contract: HookLoadContract): string | undefined {
-  const problem = rootProblem(document, contract);
+export function hookLoadProblem(
+  document: JsonObject,
+  contract: HookLoadContract,
+  facts?: ReaderFacts,
+): string | undefined {
+  const problem = (facts && readerProblem(facts, contract.reader)) ?? rootProblem(document, contract);
   if (problem) return problem;
   const hooks = document.hooks;
   if (hooks === undefined) return undefined;
   if (!isJsonObject(hooks)) return '"hooks" must be a JSON object';
   for (const [event, groups] of Object.entries(hooks)) {
     if (contract.events && !contract.events.includes(event)) continue;
-    if (!Array.isArray(groups)) return `hooks.${event} must be an array`;
-    for (const [index, group] of groups.entries()) {
-      const problem = groupProblem(group, `hooks.${event}[${index}]`, contract);
-      if (problem) return problem;
-    }
+    const eventProblem = groupsProblem(groups, `hooks.${event}`, contract);
+    if (eventProblem) return eventProblem;
+  }
+  return undefined;
+}
+
+function groupsProblem(groups: unknown, at: string, contract: HookLoadContract): string | undefined {
+  if (!Array.isArray(groups)) return `${at} must be an array`;
+  for (const [index, group] of groups.entries()) {
+    const problem = groupProblem(group, `${at}[${index}]`, contract);
+    if (problem) return problem;
   }
   return undefined;
 }

@@ -46,7 +46,7 @@ export function claudeSettingsHealth(targetRoot: string): HealthResult {
   }
 
   const read = readHookDocument(targetPath);
-  const inspection = read.ok ? inspectManagedHooks(read.source.value, scope(targetRoot)) : undefined;
+  const inspection = read.ok ? inspectManagedHooks(read.source, scope(targetRoot)) : undefined;
   const invalid = read.ok ? inspection?.invalid : read.reason;
   if (invalid !== undefined || !inspection) {
     return { name: NAME, drifted: false, status: 'error', targetPath, reason: invalid ?? 'unreadable Claude settings' };

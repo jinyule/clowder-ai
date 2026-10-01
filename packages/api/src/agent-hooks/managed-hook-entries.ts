@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import type { HealthResult } from './health.js';
 import { type HookLoadContract, hookLoadProblem } from './hook-load-contracts.js';
-import { isJsonObject, type JsonSource, type JsonValue, parseJsonSource } from './json-source.js';
+import { decodeHookConfig, isJsonObject, type JsonSource, type JsonValue, parseJsonSource } from './json-source.js';
 import { applyManagedHookEdits, type ManagedHookEditPlan } from './managed-hook-edits.js';
 
 /**
@@ -88,11 +88,12 @@ type LocatedHandlers =
   | { ok: true; byEvent: Record<ManagedHookEvent, ManagedHandlerRef[]> }
   | { ok: false; reason: string };
 
-function locateManagedHandlers(document: JsonValue, scope: ManagedHookScope): LocatedHandlers {
+function locateManagedHandlers(source: JsonSource, scope: ManagedHookScope): LocatedHandlers {
+  const document = source.value;
   if (!isJsonObject(document)) return { ok: false, reason: 'hook config root must be a JSON object' };
   const hooks = document.hooks;
   if (hooks !== undefined && !isJsonObject(hooks)) return { ok: false, reason: '"hooks" must be a JSON object' };
-  const problem = hookLoadProblem(document, scope.contract);
+  const problem = hookLoadProblem(document, scope.contract, source.facts);
   if (problem) return { ok: false, reason: `outside the verified ${scope.contract.name} loading contract: ${problem}` };
   const byEvent = {} as Record<ManagedHookEvent, ManagedHandlerRef[]>;
   for (const event of MANAGED_EVENTS) {
@@ -144,7 +145,7 @@ export function mergeManagedHooks(
   source: JsonSource,
   options: ManagedHookScope & { removeDuplicates: boolean },
 ): ManagedHookMergeResult {
-  const located = locateManagedHandlers(source.value, options);
+  const located = locateManagedHandlers(source, options);
   if (!located.ok) return { kind: 'refused', reason: located.reason };
   const duplicated = MANAGED_EVENTS.filter((event) => located.byEvent[event].length > 1);
   if (duplicated.length > 0 && !options.removeDuplicates) {
@@ -163,7 +164,7 @@ export function mergeManagedHooks(
 
   const text = applyManagedHookEdits(source, plan);
   const reparsed = parseJsonSource(text);
-  const check = reparsed.ok ? inspectManagedHooks(reparsed.source.value, options) : undefined;
+  const check = reparsed.ok ? inspectManagedHooks(reparsed.source, options) : undefined;
   const clean =
     check && !check.invalid && [check.missing, check.outdated, check.duplicated].every((e) => e.length === 0);
   if (!clean) return { kind: 'refused', reason: 'merged hook config failed verification; left unchanged' };
@@ -178,8 +179,8 @@ export interface ManagedHookInspection {
   missingBash: boolean;
 }
 
-export function inspectManagedHooks(document: JsonValue, scope: ManagedHookScope): ManagedHookInspection {
-  const located = locateManagedHandlers(document, scope);
+export function inspectManagedHooks(source: JsonSource, scope: ManagedHookScope): ManagedHookInspection {
+  const located = locateManagedHandlers(source, scope);
   if (!located.ok) return { invalid: located.reason, missing: [], outdated: [], duplicated: [], missingBash: false };
   const refs = (event: ManagedHookEvent) => located.byEvent[event];
   return {
@@ -191,19 +192,20 @@ export function inspectManagedHooks(document: JsonValue, scope: ManagedHookScope
 }
 
 export function readHookDocument(path: string): { ok: true; source: JsonSource } | { ok: false; reason: string } {
-  let text: string;
+  let bytes: Buffer;
   try {
-    text = readFileSync(path, 'utf-8');
+    bytes = readFileSync(path);
   } catch (error) {
     return { ok: false, reason: `cannot read hook config: ${error instanceof Error ? error.message : String(error)}` };
   }
-  return parseJsonSource(text);
+  const decoded = decodeHookConfig(bytes);
+  return decoded.ok ? parseJsonSource(decoded.text) : decoded;
 }
 
 /** Health of an existing shared hook JSON file; third-party content never makes it unhealthy. */
 export function managedHookFileHealth(name: string, targetPath: string, scope: ManagedHookScope): HealthResult {
   const read = readHookDocument(targetPath);
-  const inspection = read.ok ? inspectManagedHooks(read.source.value, scope) : undefined;
+  const inspection = read.ok ? inspectManagedHooks(read.source, scope) : undefined;
   const invalid = read.ok ? inspection?.invalid : read.reason;
   if (invalid !== undefined || !inspection) {
     return { name, drifted: false, status: 'error', targetPath, reason: invalid ?? 'unreadable hook config' };
