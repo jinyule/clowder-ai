@@ -1,14 +1,14 @@
 import { readFileSync } from 'node:fs';
 import type { HealthResult } from './health.js';
 import { type HookLoadContract, hookLoadProblem } from './hook-load-contracts.js';
+import { isJsonObject, type JsonSource, type JsonValue, parseJsonSource } from './json-source.js';
+import { applyManagedHookEdits, type ManagedHookEditPlan } from './managed-hook-edits.js';
 
 /**
  * Clowder-managed lifecycle entries inside hook configs that users and other tools share
  * (~/.claude/settings.json, ~/.codex/hooks.json, ~/.gemini/hooks.json). Sync may only touch
  * entries it can prove are Clowder's; everything else is preserved in place (#1566).
  */
-
-type JsonObject = Record<string, unknown>;
 
 export const MANAGED_EVENT_SCRIPTS = {
   SessionStart: 'session-start-recall.sh',
@@ -38,10 +38,6 @@ interface ParsedManagedCommand {
   arg: string;
   /** False when the spelling cannot run as written (single-quoted $HOME, quoted ~). */
   runnable: boolean;
-}
-
-function isJsonObject(value: unknown): value is JsonObject {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function splitCommand(command: string): { usesBash: boolean; path: string; quote: string; tail: string } | null {
@@ -92,20 +88,20 @@ type LocatedHandlers =
   | { ok: true; byEvent: Record<ManagedHookEvent, ManagedHandlerRef[]> }
   | { ok: false; reason: string };
 
-function locateManagedHandlers(document: unknown, scope: ManagedHookScope): LocatedHandlers {
+function locateManagedHandlers(document: JsonValue, scope: ManagedHookScope): LocatedHandlers {
   if (!isJsonObject(document)) return { ok: false, reason: 'hook config root must be a JSON object' };
   const hooks = document.hooks;
   if (hooks !== undefined && !isJsonObject(hooks)) return { ok: false, reason: '"hooks" must be a JSON object' };
   const problem = hookLoadProblem(document, scope.contract);
-  if (problem) return { ok: false, reason: `${scope.contract.name} would not load this file: ${problem}` };
+  if (problem) return { ok: false, reason: `outside the verified ${scope.contract.name} loading contract: ${problem}` };
   const byEvent = {} as Record<ManagedHookEvent, ManagedHandlerRef[]>;
   for (const event of MANAGED_EVENTS) {
-    const entries = hooks?.[event] as unknown[] | undefined;
+    const entries = hooks?.[event] as JsonValue[] | undefined;
     const desired = parseManagedCommand(scope.commands[event], scope.targetRoot);
     const refs: ManagedHandlerRef[] = [];
-    (entries ?? []).forEach((group: unknown, groupIndex: number) => {
+    (entries ?? []).forEach((group, groupIndex) => {
       if (!isJsonObject(group) || !Array.isArray(group.hooks)) return;
-      group.hooks.forEach((handler: unknown, handlerIndex: number) => {
+      group.hooks.forEach((handler, handlerIndex) => {
         if (!isJsonObject(handler) || handler.type !== 'command') return;
         const parsed = parseManagedCommand(handler.command, scope.targetRoot);
         if (parsed?.script !== MANAGED_EVENT_SCRIPTS[event]) return;
@@ -120,54 +116,58 @@ function locateManagedHandlers(document: unknown, scope: ManagedHookScope): Loca
 
 export type ManagedHookMergeResult =
   | { kind: 'unchanged' }
-  | { kind: 'updated'; document: JsonObject }
+  | { kind: 'updated'; text: string }
   | { kind: 'refused'; reason: string };
 
 function duplicateReason(events: ManagedHookEvent[]): string {
   return `duplicate Clowder-managed ${events.join('/')} hook entries; remove the extras manually`;
 }
 
+function managedGroup(command: string) {
+  return { hooks: [{ type: 'command', command }] };
+}
+
+/** A file holding only Clowder's managed entries, for targets that do not exist yet. */
+export function renderManagedHooksDocument(commands: ManagedHookCommands): string {
+  const hooks = Object.fromEntries(MANAGED_EVENTS.map((event) => [event, [managedGroup(commands[event])]]));
+  return `${JSON.stringify({ hooks }, null, 2)}\n`;
+}
+
 /**
- * Updates recognised entries in place and appends missing ones after existing groups, so
- * no third-party handler changes position (Codex keys hook trust/enabled state by position).
- * Duplicates are removed only when `removeDuplicates` is set (Claude has no positional state).
+ * Plans in-place updates of recognised entries and appends of missing ones after existing
+ * groups, then splices them into the original text: no third-party byte changes and no
+ * third-party handler changes position (Codex keys hook trust/enabled state by position and
+ * hashes values as parsed). Duplicates are removed only when `removeDuplicates` is set (Claude
+ * has no positional state). The result is re-parsed and verified before it may be written.
  */
 export function mergeManagedHooks(
-  document: unknown,
+  source: JsonSource,
   options: ManagedHookScope & { removeDuplicates: boolean },
 ): ManagedHookMergeResult {
-  const draft: unknown = structuredClone(document);
-  const located = locateManagedHandlers(draft, options);
+  const located = locateManagedHandlers(source.value, options);
   if (!located.ok) return { kind: 'refused', reason: located.reason };
   const duplicated = MANAGED_EVENTS.filter((event) => located.byEvent[event].length > 1);
-  if (duplicated.length > 0 && !options.removeDuplicates)
+  if (duplicated.length > 0 && !options.removeDuplicates) {
     return { kind: 'refused', reason: duplicateReason(duplicated) };
-
-  const doc = draft as JsonObject;
-  let changed = false;
-  for (const event of MANAGED_EVENTS) {
-    doc.hooks ??= {};
-    const hooksRoot = doc.hooks as JsonObject;
-    hooksRoot[event] ??= [];
-    const entries = hooksRoot[event] as JsonObject[];
-    const [first, ...extras] = located.byEvent[event];
-    if (!first) {
-      entries.push({ hooks: [{ type: 'command', command: options.commands[event] }] });
-      changed = true;
-      continue;
-    }
-    for (const ref of extras.reverse()) {
-      const handlers = entries[ref.groupIndex].hooks as unknown[];
-      handlers.splice(ref.handlerIndex, 1);
-      if (handlers.length === 0) entries.splice(ref.groupIndex, 1);
-      changed = true;
-    }
-    if (!first.current) {
-      (entries[first.groupIndex].hooks as JsonObject[])[first.handlerIndex].command = options.commands[event];
-      changed = true;
-    }
   }
-  return changed ? { kind: 'updated', document: doc } : { kind: 'unchanged' };
+
+  const plan: ManagedHookEditPlan = { setCommand: [], remove: [], append: [] };
+  for (const event of MANAGED_EVENTS) {
+    const [first, ...extras] = located.byEvent[event];
+    const command = options.commands[event];
+    if (!first) plan.append.push({ event, command });
+    else if (!first.current) plan.setCommand.push({ event, ...first, command });
+    plan.remove.push(...extras.map((ref) => ({ event, ...ref })));
+  }
+  if (plan.append.length + plan.setCommand.length + plan.remove.length === 0) return { kind: 'unchanged' };
+
+  const text = applyManagedHookEdits(source, plan);
+  const reparsed = parseJsonSource(text);
+  const check = reparsed.ok ? inspectManagedHooks(reparsed.source.value, options) : undefined;
+  const clean =
+    check && !check.invalid && [check.missing, check.outdated, check.duplicated].every((e) => e.length === 0);
+  if (!clean) return { kind: 'refused', reason: 'merged hook config failed verification; left unchanged' };
+  return { kind: 'updated', text };
 }
 
 export interface ManagedHookInspection {
@@ -178,7 +178,7 @@ export interface ManagedHookInspection {
   missingBash: boolean;
 }
 
-export function inspectManagedHooks(document: unknown, scope: ManagedHookScope): ManagedHookInspection {
+export function inspectManagedHooks(document: JsonValue, scope: ManagedHookScope): ManagedHookInspection {
   const located = locateManagedHandlers(document, scope);
   if (!located.ok) return { invalid: located.reason, missing: [], outdated: [], duplicated: [], missingBash: false };
   const refs = (event: ManagedHookEvent) => located.byEvent[event];
@@ -190,18 +190,20 @@ export function inspectManagedHooks(document: unknown, scope: ManagedHookScope):
   };
 }
 
-export function readHookDocument(path: string): { ok: true; document: unknown } | { ok: false; reason: string } {
+export function readHookDocument(path: string): { ok: true; source: JsonSource } | { ok: false; reason: string } {
+  let text: string;
   try {
-    return { ok: true, document: JSON.parse(readFileSync(path, 'utf-8')) };
+    text = readFileSync(path, 'utf-8');
   } catch (error) {
     return { ok: false, reason: `cannot read hook config: ${error instanceof Error ? error.message : String(error)}` };
   }
+  return parseJsonSource(text);
 }
 
 /** Health of an existing shared hook JSON file; third-party content never makes it unhealthy. */
 export function managedHookFileHealth(name: string, targetPath: string, scope: ManagedHookScope): HealthResult {
   const read = readHookDocument(targetPath);
-  const inspection = read.ok ? inspectManagedHooks(read.document, scope) : undefined;
+  const inspection = read.ok ? inspectManagedHooks(read.source.value, scope) : undefined;
   const invalid = read.ok ? inspection?.invalid : read.reason;
   if (invalid !== undefined || !inspection) {
     return { name, drifted: false, status: 'error', targetPath, reason: invalid ?? 'unreadable hook config' };

@@ -3,7 +3,12 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { HealthResult } from './health.js';
 import { HOOK_LOAD_CONTRACTS } from './hook-load-contracts.js';
-import { inspectManagedHooks, mergeManagedHooks, readHookDocument } from './managed-hook-entries.js';
+import {
+  inspectManagedHooks,
+  mergeManagedHooks,
+  readHookDocument,
+  renderManagedHooksDocument,
+} from './managed-hook-entries.js';
 import { managedHookCommands, type SyncOutcome } from './sync-targets.js';
 
 const NAME = 'claude-settings';
@@ -41,7 +46,7 @@ export function claudeSettingsHealth(targetRoot: string): HealthResult {
   }
 
   const read = readHookDocument(targetPath);
-  const inspection = read.ok ? inspectManagedHooks(read.document, scope(targetRoot)) : undefined;
+  const inspection = read.ok ? inspectManagedHooks(read.source.value, scope(targetRoot)) : undefined;
   const invalid = read.ok ? inspection?.invalid : read.reason;
   if (invalid !== undefined || !inspection) {
     return { name: NAME, drifted: false, status: 'error', targetPath, reason: invalid ?? 'unreadable Claude settings' };
@@ -85,9 +90,14 @@ export async function syncClaudeSettings(targetRoot: string): Promise<SyncOutcom
     action,
     ...(reason ? { reason } : {}),
   });
-  const read = existsSync(targetPath) ? readHookDocument(targetPath) : ({ ok: true, document: {} } as const);
+  if (!existsSync(targetPath)) {
+    await mkdir(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, renderManagedHooksDocument(scope(targetRoot).commands), 'utf-8');
+    return outcome('written');
+  }
+  const read = readHookDocument(targetPath);
   const result = read.ok
-    ? mergeManagedHooks(read.document, { ...scope(targetRoot), removeDuplicates: true })
+    ? mergeManagedHooks(read.source, { ...scope(targetRoot), removeDuplicates: true })
     : ({ kind: 'refused', reason: read.reason } as const);
   if (result.kind === 'refused') {
     console.warn(`skipped ${NAME}: ${result.reason} (${targetPath} left unchanged)`);
@@ -95,8 +105,7 @@ export async function syncClaudeSettings(targetRoot: string): Promise<SyncOutcom
   }
   if (result.kind === 'unchanged') return outcome('unchanged');
 
-  await mkdir(dirname(targetPath), { recursive: true });
   // writeFileSync follows symlinks, so dotfile-managed settings stay links.
-  writeFileSync(targetPath, `${JSON.stringify(result.document, null, 2)}\n`, 'utf-8');
+  writeFileSync(targetPath, result.text, 'utf-8');
   return outcome('written');
 }

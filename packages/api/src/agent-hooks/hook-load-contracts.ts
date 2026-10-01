@@ -5,7 +5,7 @@
  * verified for that CLI version. Fields and event names a CLI ignores are accepted (#1566).
  */
 
-type JsonObject = Record<string, unknown>;
+import { isJsonObject, JsonNumber, type JsonObject } from './json-source.js';
 
 interface Check {
   ok: (value: unknown) => boolean;
@@ -15,6 +15,8 @@ interface Check {
 interface HandlerSpec {
   required: Readonly<Record<string, Check>>;
   optional: Readonly<Record<string, Check>>;
+  /** Field aliases the CLI maps to one field; more than one present is a duplicate field. */
+  aliases?: readonly (readonly string[])[];
 }
 
 export interface HookLoadContract {
@@ -35,16 +37,24 @@ export interface HookLoadContract {
   configuredNote?: string;
 }
 
-function isJsonObject(value: unknown): value is JsonObject {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
 const check = (ok: (value: unknown) => boolean, expect: string): Check => ({ ok, expect });
+const isNumber = (v: unknown): v is JsonNumber => v instanceof JsonNumber && Number.isFinite(v.value);
+const isIntegerLexeme = (v: JsonNumber) => /^-?(?:0|[1-9]\d*)$/.test(v.raw);
+/** Codex hashes each handler as TOML, whose integers stop at i64::MAX; larger values panic hooks discovery. */
+const I64_MAX = 2n ** 63n - 1n;
 const str = check((v) => typeof v === 'string', 'a string');
 const bool = check((v) => typeof v === 'boolean', 'a boolean');
-const num = check((v) => typeof v === 'number' && Number.isFinite(v), 'a number');
-const positive = check((v) => typeof v === 'number' && Number.isFinite(v) && v > 0, 'a positive number');
-const nonNegInt = check((v) => Number.isSafeInteger(v) && (v as number) >= 0, 'a non-negative integer');
+const num = check(isNumber, 'a number');
+const positive = check((v) => isNumber(v) && v.value > 0, 'a positive number');
+/**
+ * Codex u64/usize hook fields: an integer literal (`5.0` and `5e0` are rejected as floats) no larger
+ * than i64::MAX (verified against Codex 0.159.3: one more crashes app-server hook discovery).
+ */
+const unsignedInt = check((v) => {
+  if (!isNumber(v) || !isIntegerLexeme(v)) return false;
+  const value = BigInt(v.raw);
+  return value >= 0n && value <= I64_MAX;
+}, 'an integer literal from 0 to 9223372036854775807');
 const object = check(isJsonObject, 'an object');
 const strArray = check((v) => Array.isArray(v) && v.every((item) => typeof item === 'string'), 'an array of strings');
 const strRecord = check(
@@ -54,13 +64,18 @@ const strRecord = check(
 const nullable = (inner: Check) => check((v) => v === null || inner.ok(v), `${inner.expect} or null`);
 const oneOf = (...values: string[]) =>
   check((v) => typeof v === 'string' && values.includes(v), `one of ${values.join(', ')}`);
-const hasNull = (v: unknown): boolean =>
-  v === null || (typeof v === 'object' && Object.values(v as JsonObject).some((item) => hasNull(item)));
-const tomlObject = check((v) => isJsonObject(v) && !hasNull(v), 'an object without null values');
-const handler = (required: HandlerSpec['required'], optional: HandlerSpec['optional'] = {}): HandlerSpec => ({
-  required,
-  optional,
-});
+/** Codex converts mcp_tool input to TOML, which has no null; every JSON number is accepted (verified). */
+const tomlRepresentable = (v: unknown): boolean => {
+  if (v === null) return false;
+  if (typeof v !== 'object' || v instanceof JsonNumber) return true;
+  return Object.values(v as JsonObject).every((item) => tomlRepresentable(item));
+};
+const tomlObject = check((v) => isJsonObject(v) && tomlRepresentable(v), 'an object representable as TOML');
+const handler = (
+  required: HandlerSpec['required'],
+  optional: HandlerSpec['optional'] = {},
+  aliases: HandlerSpec['aliases'] = [],
+): HandlerSpec => ({ required, optional, aliases });
 
 /** codex-rs/config/src/hook_config.rs at rust-v0.159.3 (HooksFile, MatcherGroup, HookHandlerConfig). */
 const CODEX: HookLoadContract = {
@@ -90,15 +105,16 @@ const CODEX: HookLoadContract = {
       {
         commandWindows: nullable(str),
         command_windows: nullable(str),
-        timeout: nullable(nonNegInt),
+        timeout: nullable(unsignedInt),
         async: bool,
         statusMessage: nullable(str),
-        additionalContextLimit: nullable(nonNegInt),
+        additionalContextLimit: nullable(unsignedInt),
       },
+      [['commandWindows', 'command_windows']],
     ),
     mcp_tool: handler(
       { server: str, tool: str },
-      { input: tomlObject, timeout: nullable(nonNegInt), statusMessage: nullable(str) },
+      { input: tomlObject, timeout: nullable(unsignedInt), statusMessage: nullable(str) },
     ),
     prompt: handler({}),
     agent: handler({}),
@@ -141,8 +157,12 @@ export const HOOK_LOAD_CONTRACTS = { codex: CODEX, claude: CLAUDE, gemini: SHARE
 
 function handlerProblem(value: unknown, at: string, contract: HookLoadContract): string | undefined {
   if (!isJsonObject(value) || typeof value.type !== 'string') return `${at} must be an object with a string "type"`;
-  const spec = contract.handlers[value.type] ?? contract.otherHandlers;
-  if (!spec) return `${at}.type "${value.type}" is not a handler type it loads`;
+  const spec = Object.hasOwn(contract.handlers, value.type) ? contract.handlers[value.type] : contract.otherHandlers;
+  if (!spec) return `${at}.type ${JSON.stringify(value.type)} is not a handler type it loads`;
+  for (const names of spec.aliases ?? []) {
+    const present = names.filter((name) => Object.hasOwn(value, name));
+    if (present.length > 1) return `${at} sets ${present.join(' and ')}, which are the same field`;
+  }
   for (const [field, rule] of Object.entries(spec.required)) {
     if (!rule.ok(value[field])) return `${at}.${field} is required and must be ${rule.expect}`;
   }

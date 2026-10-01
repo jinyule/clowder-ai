@@ -9,6 +9,7 @@ import {
   managedHookFileHealth,
   mergeManagedHooks,
   readHookDocument,
+  renderManagedHooksDocument,
 } from './managed-hook-entries.js';
 
 export type SyncTargetContentKind = 'text' | 'json';
@@ -111,7 +112,7 @@ function mergeSync(target: SyncTarget, scope: ManagedHookScope, dryRun: boolean)
   });
   const read = readHookDocument(target.targetPath);
   const result = read.ok
-    ? mergeManagedHooks(read.document, { ...scope, removeDuplicates: false })
+    ? mergeManagedHooks(read.source, { ...scope, removeDuplicates: false })
     : ({ kind: 'refused', reason: read.reason } as const);
   if (result.kind === 'refused') {
     console.warn(`skipped ${target.name}: ${result.reason} (${target.targetPath} left unchanged)`);
@@ -119,7 +120,7 @@ function mergeSync(target: SyncTarget, scope: ManagedHookScope, dryRun: boolean)
   }
   if (result.kind === 'unchanged') return outcome('unchanged');
 
-  const merged = `${JSON.stringify(result.document, null, 2)}\n`;
+  const merged = result.text;
   if (dryRun) {
     console.log(`\n=== ${target.name} -> ${target.targetPath} (dry-run merge) ===\n`);
     console.log(merged);
@@ -178,22 +179,12 @@ export function managedHookCommands(consumer: ManagedHookConsumer, targetRoot: s
   };
 }
 
-function renderManagedHooksJson(commands: ManagedHookCommands): string {
-  const config = {
-    hooks: {
-      SessionStart: [{ hooks: [{ type: 'command', command: commands.SessionStart }] }],
-      Stop: [{ hooks: [{ type: 'command', command: commands.Stop }] }],
-    },
-  };
-  return `${JSON.stringify(config, null, 2)}\n`;
-}
-
 export function renderCodexHooksJson(targetRoot: string): string {
-  return renderManagedHooksJson(managedHookCommands('codex', targetRoot));
+  return renderManagedHooksDocument(managedHookCommands('codex', targetRoot));
 }
 
 export function renderGeminiHooksJson(targetRoot: string): string {
-  return renderManagedHooksJson(managedHookCommands('gemini', targetRoot));
+  return renderManagedHooksDocument(managedHookCommands('gemini', targetRoot));
 }
 
 export function buildAgentHookTargets({ projectRoot, targetRoot }: BuildAgentHookTargetsOptions): SyncTarget[] {
