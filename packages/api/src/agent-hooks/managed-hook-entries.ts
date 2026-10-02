@@ -84,6 +84,20 @@ interface ManagedHandlerRef {
   current: boolean;
 }
 
+/**
+ * Clowder only ever writes `{hooks:[…]}` groups holding `{type:"command", command}` handlers. Any other
+ * key changes how or when a handler runs (exec-form `args` — even empty — selects direct invocation,
+ * `shell`, `if`, `async`/`asyncRewake`, `once`, `timeout`, `statusMessage`, Codex `commandWindows` /
+ * `command_windows` / `additionalContextLimit`, group `matcher`, unknown fields), so such an entry is
+ * someone else's: it is preserved in place, never rewritten or removed as a duplicate (#1570 review).
+ */
+const CLOWDER_GROUP_KEYS = new Set(['hooks']);
+const CLOWDER_HANDLER_KEYS = new Set(['type', 'command']);
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: Set<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
 type LocatedHandlers =
   | { ok: true; byEvent: Record<ManagedHookEvent, ManagedHandlerRef[]> }
   | { ok: false; reason: string };
@@ -101,9 +115,10 @@ function locateManagedHandlers(source: JsonSource, scope: ManagedHookScope): Loc
     const desired = parseManagedCommand(scope.commands[event], scope.targetRoot);
     const refs: ManagedHandlerRef[] = [];
     (entries ?? []).forEach((group, groupIndex) => {
-      if (!isJsonObject(group) || !Array.isArray(group.hooks)) return;
+      if (!isJsonObject(group) || !Array.isArray(group.hooks) || !hasOnlyKeys(group, CLOWDER_GROUP_KEYS)) return;
       group.hooks.forEach((handler, handlerIndex) => {
         if (!isJsonObject(handler) || handler.type !== 'command') return;
+        if (!hasOnlyKeys(handler, CLOWDER_HANDLER_KEYS)) return;
         const parsed = parseManagedCommand(handler.command, scope.targetRoot);
         if (parsed?.script !== MANAGED_EVENT_SCRIPTS[event]) return;
         const current = parsed.usesBash && parsed.runnable && parsed.arg === desired?.arg;
